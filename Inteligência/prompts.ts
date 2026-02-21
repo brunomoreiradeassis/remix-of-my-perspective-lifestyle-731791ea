@@ -3,7 +3,7 @@
 // Templates de prompts para planejamento, execução e conversa
 // ---------------------------------------------------------------------------
 
-import type { ProjectMetadata } from "../src/services/projectScanner";
+import type { ProjectMetadata } from "@/services/projectScanner";
 import { buildSkillsPrompt } from "./skills";
 
 export function buildPlanningPrompt(meta: ProjectMetadata): string {

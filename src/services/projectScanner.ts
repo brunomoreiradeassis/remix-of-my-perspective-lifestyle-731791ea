@@ -33,6 +33,7 @@ export interface ProjectMetadata {
     stateManagement: string | null; // "zustand" | "redux" | "context" | null
     uiLibrary: string | null; // "shadcn" | "mui" | "antd" | null
     cssStrategy: string | null; // "tailwind" | "modules" | "styled" | "css" | null
+    hasApiCalls: boolean;
   };
 
   // Resumo textual para o prompt
@@ -287,6 +288,12 @@ export function scanProject(
           : styles.length > 0
             ? "css"
             : null,
+    hasApiCalls:
+      "axios" in allDeps ||
+      "@tanstack/react-query" in allDeps ||
+      "react-query" in allDeps ||
+      "swr" in allDeps ||
+      virtualFiles.some((vf) => /fetch\s*\(/.test(vf.code)),
   };
 
   // Gerar resumo textual

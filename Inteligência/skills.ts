@@ -3,7 +3,7 @@
 // Registro de skills e capacidades do sistema com validações avançadas
 // ---------------------------------------------------------------------------
 
-import type { ProjectMetadata } from "../src/services/projectScanner";
+import type { ProjectMetadata } from "@/services/projectScanner";
 
 export interface Skill {
   id: string;
