@@ -24,14 +24,19 @@ if (!fs.existsSync(PROJECTS_ROOT)) {
 let currentProcess = null;
 
 // ============================================================
+// Estado global para monitoramento de erros do Vite
+// ============================================================
+let viteErrorBuffer = [];
+let processedErrors = new Set();
+let sseClients = [];
+
+// ============================================================
 // Middleware: Servir arquivos estáticos dos projetos (imagens, fontes, etc.)
 // ============================================================
 app.use('/project-assets', express.static(PROJECTS_ROOT, {
     setHeaders: (res, filePath) => {
-        // CORS headers para assets
         res.set('Access-Control-Allow-Origin', '*');
-        // Cache de 1h para assets estáticos
-        if (/\.(png|jpg|jpeg|gif|svg|webp|ico|woff|woff2|ttf|eot|mp4|mp3)$/i.test(filePath)) {
+        if (/\.(png|jpg|jpeg|gif|svg|webp|ico|woff|woff2|ttf|eot|mp4|mp3|css|js|json|html)$/i.test(filePath)) {
             res.set('Cache-Control', 'public, max-age=3600');
         }
     }
@@ -61,10 +66,266 @@ app.get('/', (req, res) => {
             execute: '/execute (POST)',
             status: '/status (GET)',
             validate: '/validate-project (POST)',
-            assets: '/project-assets/<projectName>/... (GET)'
+            assets: '/project-assets/<projectName>/... (GET)',
+            watchErrors: '/watch-errors (GET - SSE)'
         }
     });
 });
+
+// ============================================================
+// Helper: Escanear recursivamente arquivos por extensão
+// ============================================================
+function scanFilesRecursive(dir, extensions, denyDirs = ['node_modules', '.git', 'dist', '.vite', 'build', '.next', '.cache', '.turbo']) {
+    const results = [];
+    
+    function scan(currentDir, basePath) {
+        let entries;
+        try {
+            entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        } catch { return; }
+        
+        for (const entry of entries) {
+            const rel = basePath ? path.join(basePath, entry.name) : entry.name;
+            const abs = path.join(currentDir, entry.name);
+            
+            if (entry.isDirectory()) {
+                if (denyDirs.includes(entry.name)) continue;
+                scan(abs, rel);
+            } else {
+                const ext = path.extname(entry.name).toLowerCase();
+                if (extensions.includes(ext)) {
+                    results.push({ path: rel.replace(/\\/g, '/'), abs });
+                }
+            }
+        }
+    }
+    
+    scan(dir, '');
+    return results;
+}
+
+// ============================================================
+// Auto-fix: Corrige um erro do Vite baseado no padrão detectado
+// ============================================================
+function autoFixViteError(errorMessage, projectDir) {
+    const fixes = [];
+    
+    // Pattern 1: @layer sem @tailwind directives
+    const layerMatch = errorMessage.match(/`@layer\s+(base|components|utilities)`.*no matching.*`@tailwind\s+(base|components|utilities)`/i)
+        || errorMessage.match(/@layer\s+(base|components|utilities).*@tailwind/i);
+    if (layerMatch || /`@layer base` is used but no matching `@tailwind base`/i.test(errorMessage)) {
+        // Encontra o arquivo CSS mencionado no erro
+        const fileMatch = errorMessage.match(/([^\s:]+\.css):\d+:\d+/i) || errorMessage.match(/File:\s*([^\s:]+\.css)/i);
+        let cssFile = null;
+        
+        if (fileMatch) {
+            // Extrai apenas o caminho relativo ao projeto
+            const fullPath = fileMatch[1].replace(/\\/g, '/');
+            const projIdx = fullPath.indexOf('/src/');
+            cssFile = projIdx >= 0 ? fullPath.substring(projIdx + 1) : fullPath;
+        }
+        
+        // Se não encontrou no erro, escaneia todos os CSS
+        const cssFiles = cssFile 
+            ? [{ path: cssFile, abs: path.join(projectDir, cssFile) }]
+            : scanFilesRecursive(projectDir, ['.css']);
+        
+        for (const file of cssFiles) {
+            if (!fs.existsSync(file.abs)) continue;
+            try {
+                let content = fs.readFileSync(file.abs, 'utf8');
+                const hasLayer = /@layer\s+(base|components|utilities)/i.test(content);
+                const hasTailwind = /@tailwind\s+(base|components|utilities)/i.test(content);
+                
+                if (hasLayer && !hasTailwind) {
+                    const tailwindDirectives = '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n';
+                    
+                    // Encontra posição após últimos @import
+                    const importRegex = /@import\s+[^;]+;/g;
+                    let lastImportEnd = 0;
+                    let match;
+                    while ((match = importRegex.exec(content)) !== null) {
+                        lastImportEnd = match.index + match[0].length;
+                    }
+                    
+                    if (lastImportEnd > 0) {
+                        content = content.slice(0, lastImportEnd) + '\n\n' + tailwindDirectives + content.slice(lastImportEnd);
+                    } else {
+                        content = tailwindDirectives + content;
+                    }
+                    
+                    fs.writeFileSync(file.abs, content, 'utf8');
+                    fixes.push(`Adicionado @tailwind base/components/utilities em ${file.path}`);
+                }
+            } catch (e) {
+                console.warn(`Erro ao corrigir ${file.path}:`, e.message);
+            }
+        }
+    }
+    
+    // Pattern 2: @import depois de @tailwind
+    if (/@import.*depois.*@tailwind|@import.*after.*@tailwind|@import must precede/i.test(errorMessage)) {
+        const cssFiles = scanFilesRecursive(projectDir, ['.css']);
+        for (const file of cssFiles) {
+            try {
+                let content = fs.readFileSync(file.abs, 'utf8');
+                const firstImportIdx = content.search(/@import\s+[^;]+;/);
+                const firstTailwindIdx = content.search(/@tailwind\s+(base|components|utilities)\s*;/);
+                
+                if (firstImportIdx !== -1 && firstTailwindIdx !== -1 && firstTailwindIdx < firstImportIdx) {
+                    const importRegex = /@import\s+[^;]+;/g;
+                    const imports = [];
+                    let m;
+                    while ((m = importRegex.exec(content)) !== null) imports.push(m[0]);
+                    
+                    if (imports.length > 0) {
+                        const withoutImports = content.replace(importRegex, '').trimStart();
+                        content = `${imports.join('\n')}\n\n${withoutImports}`;
+                        fs.writeFileSync(file.abs, content, 'utf8');
+                        fixes.push(`Reorganizado @import para o topo em ${file.path}`);
+                    }
+                }
+            } catch (e) { /* skip */ }
+        }
+    }
+    
+    // Pattern 3: Porta em conflito
+    if (/EADDRINUSE|port.*already in use|porta.*em uso/i.test(errorMessage)) {
+        const configFiles = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
+        for (const cf of configFiles) {
+            const cfPath = path.join(projectDir, cf);
+            if (fs.existsSync(cfPath)) {
+                try {
+                    let code = fs.readFileSync(cfPath, 'utf8');
+                    const portMatch = code.match(/port\s*:\s*(\d+)/);
+                    if (portMatch) {
+                        const oldPort = Number(portMatch[1]);
+                        const newPort = oldPort === 8080 ? 8081 : oldPort + 1;
+                        code = code.replace(/port\s*:\s*\d+/, `port: ${newPort}`);
+                        fs.writeFileSync(cfPath, code, 'utf8');
+                        fixes.push(`Porta alterada de ${oldPort} para ${newPort} em ${cf}`);
+                    }
+                } catch { /* skip */ }
+                break;
+            }
+        }
+    }
+    
+    // Pattern 4: export default faltando em App
+    if (/does not provide an export named 'default'.*App|App.*export default/i.test(errorMessage)) {
+        for (const appFile of ['src/App.tsx', 'src/App.jsx', 'src/App.ts', 'src/App.js']) {
+            const appPath = path.join(projectDir, appFile);
+            if (fs.existsSync(appPath)) {
+                try {
+                    let code = fs.readFileSync(appPath, 'utf8');
+                    const hasExportDefault = /export\s+default\s+(function|class|const|let|var|\w)/m.test(code);
+                    const hasDefaultExport = /export\s*\{\s*[^}]*\bas\s+default\b/m.test(code);
+                    
+                    if (!hasExportDefault && !hasDefaultExport) {
+                        const funcMatch = code.match(/(?:function|const)\s+(App)\s*[=(]/i);
+                        const componentName = funcMatch?.[1] || 'App';
+                        code = code.trimEnd() + `\n\nexport default ${componentName};\n`;
+                        fs.writeFileSync(appPath, code, 'utf8');
+                        fixes.push(`Adicionado export default ${componentName} em ${appFile}`);
+                    }
+                } catch { /* skip */ }
+                break;
+            }
+        }
+    }
+    
+    // Pattern 5: PostCSS/Tailwind config missing
+    if (/Cannot find.*tailwindcss|tailwind.*not found|postcss.*plugin.*not found/i.test(errorMessage)) {
+        // Verifica se postcss.config existe
+        const postcssConfigs = ['postcss.config.js', 'postcss.config.cjs', 'postcss.config.mjs'];
+        const hasPostcss = postcssConfigs.some(c => fs.existsSync(path.join(projectDir, c)));
+        
+        if (!hasPostcss) {
+            const postcssContent = `module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`;
+            fs.writeFileSync(path.join(projectDir, 'postcss.config.js'), postcssContent, 'utf8');
+            fixes.push('Criado postcss.config.js com tailwindcss e autoprefixer');
+        }
+        
+        // Verifica se tailwind.config existe
+        const tailwindConfigs = ['tailwind.config.ts', 'tailwind.config.js', 'tailwind.config.cjs'];
+        const hasTailwind = tailwindConfigs.some(c => fs.existsSync(path.join(projectDir, c)));
+        
+        if (!hasTailwind) {
+            const tailwindContent = `/** @type {import('tailwindcss').Config} */\nexport default {\n  content: [\n    "./index.html",\n    "./src/**/*.{js,ts,jsx,tsx}",\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n`;
+            fs.writeFileSync(path.join(projectDir, 'tailwind.config.ts'), tailwindContent, 'utf8');
+            fixes.push('Criado tailwind.config.ts com configuração padrão');
+        }
+    }
+    
+    // Pattern 6: Failed to resolve import
+    if (/Failed to resolve import|Module ".*" has been externalized/i.test(errorMessage)) {
+        const importMatch = errorMessage.match(/Failed to resolve import "([^"]+)" from "([^"]+)"/i);
+        if (importMatch) {
+            const moduleName = importMatch[1];
+            const fromFile = importMatch[2];
+            // Se é um import relativo, tenta verificar se o arquivo existe
+            if (moduleName.startsWith('.') || moduleName.startsWith('/')) {
+                fixes.push(`[INFO] Import relativo quebrado: "${moduleName}" em "${fromFile}" - requer correção manual ou via IA`);
+            } else {
+                fixes.push(`[INFO] Pacote "${moduleName}" pode estar faltando - tente: pnpm add ${moduleName}`);
+            }
+        }
+    }
+    
+    // Pattern 7: Pre-transform error genérico com CSS
+    if (/Pre-transform error.*\.css/i.test(errorMessage)) {
+        // Tenta fix genérico em todos os CSS do projeto
+        const cssFiles = scanFilesRecursive(projectDir, ['.css']);
+        for (const file of cssFiles) {
+            try {
+                let content = fs.readFileSync(file.abs, 'utf8');
+                let changed = false;
+                
+                // Fix @layer sem @tailwind
+                const hasLayer = /@layer\s+(base|components|utilities)/i.test(content);
+                const hasTailwind = /@tailwind\s+(base|components|utilities)/i.test(content);
+                
+                if (hasLayer && !hasTailwind) {
+                    const tailwindDirectives = '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n';
+                    const importRegex = /@import\s+[^;]+;/g;
+                    let lastImportEnd = 0;
+                    let m;
+                    while ((m = importRegex.exec(content)) !== null) {
+                        lastImportEnd = m.index + m[0].length;
+                    }
+                    
+                    if (lastImportEnd > 0) {
+                        content = content.slice(0, lastImportEnd) + '\n\n' + tailwindDirectives + content.slice(lastImportEnd);
+                    } else {
+                        content = tailwindDirectives + content;
+                    }
+                    changed = true;
+                }
+                
+                // Fix @import after @tailwind
+                const firstImportIdx = content.search(/@import\s+[^;]+;/);
+                const firstTailwindIdx = content.search(/@tailwind\s+(base|components|utilities)\s*;/);
+                if (firstImportIdx !== -1 && firstTailwindIdx !== -1 && firstTailwindIdx < firstImportIdx) {
+                    const impRegex = /@import\s+[^;]+;/g;
+                    const imports = [];
+                    let mm;
+                    while ((mm = impRegex.exec(content)) !== null) imports.push(mm[0]);
+                    if (imports.length > 0) {
+                        content = imports.join('\n') + '\n\n' + content.replace(impRegex, '').trimStart();
+                        changed = true;
+                    }
+                }
+                
+                if (changed) {
+                    fs.writeFileSync(file.abs, content, 'utf8');
+                    fixes.push(`Auto-fix CSS aplicado em ${file.path}`);
+                }
+            } catch { /* skip */ }
+        }
+    }
+    
+    return fixes;
+}
 
 // ============================================================
 // Validação de projeto: verifica exports, imports, entry points
@@ -79,14 +340,11 @@ function validateAndFixProject(projectDir) {
     if (fs.existsSync(indexHtmlPath)) {
         try {
             let html = fs.readFileSync(indexHtmlPath, 'utf8');
-            // Verifica se aponta para main.tsx ou main.ts ou main.jsx ou main.js
             if (!/<script.*src=.*main\.(tsx|ts|jsx|js)/i.test(html)) {
                 issues.push('index.html não aponta para nenhum entry point (main.tsx/ts/jsx/js)');
-                // Tenta corrigir se houver um src/main.tsx
                 for (const ext of ['tsx', 'ts', 'jsx', 'js']) {
                     if (fs.existsSync(path.join(projectDir, `src/main.${ext}`))) {
                         if (!html.includes(`/src/main.${ext}`)) {
-                            // Adiciona script tag antes do </body>
                             if (html.includes('</body>')) {
                                 html = html.replace('</body>', `  <script type="module" src="/src/main.${ext}"></script>\n  </body>`);
                                 fs.writeFileSync(indexHtmlPath, html, 'utf8');
@@ -115,20 +373,15 @@ function validateAndFixProject(projectDir) {
                 
                 if (!hasExportDefault && !hasDefaultExport) {
                     issues.push(`${appFile} não tem export default`);
-                    
-                    // Tenta detectar o nome do componente principal
                     const funcMatch = code.match(/(?:function|const)\s+(App)\s*[=(]/i);
                     const className = code.match(/class\s+(App)\s+/i);
                     const componentName = funcMatch?.[1] || className?.[1] || 'App';
                     
-                    // Verifica se já existe "export { App }" ou similar  
                     if (!code.includes(`export { ${componentName} }`)) {
-                        // Adiciona export default no final
                         code = code.trimEnd() + `\n\nexport default ${componentName};\n`;
                         fs.writeFileSync(appPath, code, 'utf8');
                         fixes.push(`Adicionado "export default ${componentName}" ao ${appFile}`);
                     } else {
-                        // Converte export { App } para export default App
                         code = code.replace(
                             new RegExp(`export\\s*\\{\\s*${componentName}\\s*\\}`),
                             `export default ${componentName}`
@@ -140,7 +393,7 @@ function validateAndFixProject(projectDir) {
             } catch (e) {
                 issues.push(`Erro ao ler ${appFile}: ${e.message}`);
             }
-            break; // Só precisa verificar o primeiro encontrado
+            break;
         }
     }
 
@@ -150,13 +403,9 @@ function validateAndFixProject(projectDir) {
         if (fs.existsSync(mainPath)) {
             try {
                 let code = fs.readFileSync(mainPath, 'utf8');
-                
-                // Verifica se importa App
                 if (!code.includes('./App') && !code.includes("'./App'") && !code.includes('"./App"')) {
                     issues.push(`${mainFile} não importa App`);
                 }
-                
-                // Verifica se tem import de react e react-dom
                 if (!code.includes('react-dom') && !code.includes('ReactDOM')) {
                     issues.push(`${mainFile} não importa react-dom`);
                 }
@@ -173,8 +422,6 @@ function validateAndFixProject(projectDir) {
         if (fs.existsSync(configPath)) {
             try {
                 let code = fs.readFileSync(configPath, 'utf8');
-                
-                // Detecta porta 8080 (conflito com BuilderAI)
                 const portMatch = code.match(/port\s*:\s*(\d+)/);
                 if (portMatch && Number(portMatch[1]) === 8080) {
                     issues.push(`${configFile} usa porta 8080 (conflito com BuilderAI)`);
@@ -182,10 +429,7 @@ function validateAndFixProject(projectDir) {
                     fs.writeFileSync(configPath, code, 'utf8');
                     fixes.push(`Porta alterada de 8080 para 8081 no ${configFile}`);
                 }
-                
-                // Se não tem porta definida, adiciona porta 8081
                 if (!portMatch) {
-                    // Tenta inserir port: 8081 no bloco server
                     if (/server\s*:\s*\{/.test(code)) {
                         code = code.replace(/server\s*:\s*\{/, 'server: {\n    port: 8081,');
                         fs.writeFileSync(configPath, code, 'utf8');
@@ -213,63 +457,84 @@ function validateAndFixProject(projectDir) {
         issues.push('Projeto TypeScript sem tsconfig.json');
     }
 
-    const cssFiles = ['src/index.css', 'src/styles.css', 'src/globals.css', 'src/app.css'];
-    for (const cssFile of cssFiles) {
-        const cssPath = path.join(projectDir, cssFile);
-        if (fs.existsSync(cssPath)) {
-            try {
-                let cssContent = fs.readFileSync(cssPath, 'utf8');
-                const hasLayer = /@layer\s+(base|components|utilities)/i.test(cssContent);
-                const hasTailwindDirective = /@tailwind\s+(base|components|utilities)/i.test(cssContent);
+    // 6. UNIVERSAL: Escanear TODOS os CSS recursivamente
+    const allCssFiles = scanFilesRecursive(projectDir, ['.css']);
+    for (const cssFileInfo of allCssFiles) {
+        try {
+            let cssContent = fs.readFileSync(cssFileInfo.abs, 'utf8');
+            const hasLayer = /@layer\s+(base|components|utilities)/i.test(cssContent);
+            const hasTailwindDirective = /@tailwind\s+(base|components|utilities)/i.test(cssContent);
+            
+            if (hasLayer && !hasTailwindDirective) {
+                issues.push(`${cssFileInfo.path} usa @layer sem @tailwind directives`);
                 
-                if (hasLayer && !hasTailwindDirective) {
-                    issues.push(`${cssFile} usa @layer sem @tailwind directives`);
-                    
-                    // Auto-fix: inserir @tailwind directives no topo (após @imports)
-                    const tailwindDirectives = '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n';
-                    
-                    // Encontra posição após últimos @import
-                    const importRegex = /@import\s+[^;]+;/g;
-                    let lastImportEnd = 0;
-                    let match;
-                    while ((match = importRegex.exec(cssContent)) !== null) {
-                        lastImportEnd = match.index + match[0].length;
-                    }
-                    
-                    if (lastImportEnd > 0) {
-                        cssContent = cssContent.slice(0, lastImportEnd) + '\n\n' + tailwindDirectives + cssContent.slice(lastImportEnd);
-                    } else {
-                        cssContent = tailwindDirectives + cssContent;
-                    }
-                    
-                    fs.writeFileSync(cssPath, cssContent, 'utf8');
-                    fixes.push(`Adicionado @tailwind base/components/utilities ao ${cssFile}`);
+                const tailwindDirectives = '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n';
+                const importRegex = /@import\s+[^;]+;/g;
+                let lastImportEnd = 0;
+                let match;
+                while ((match = importRegex.exec(cssContent)) !== null) {
+                    lastImportEnd = match.index + match[0].length;
                 }
-
-                const firstImportIndex = cssContent.search(/@import\s+[^;]+;/);
-                const firstTailwindIndex = cssContent.search(/@tailwind\s+(base|components|utilities)\s*;/);
-
-                if (firstImportIndex !== -1 && firstTailwindIndex !== -1 && firstTailwindIndex < firstImportIndex) {
-                    issues.push(`${cssFile} tem @import depois de @tailwind (deve vir antes de todas as declarações)`);
-
-                    const importRegex = /@import\s+[^;]+;/g;
-                    const imports = [];
-                    let match;
-                    while ((match = importRegex.exec(cssContent)) !== null) {
-                        imports.push(match[0]);
-                    }
-
-                    if (imports.length > 0) {
-                        const cssWithoutImports = cssContent.replace(importRegex, '').trimStart();
-                        const newCss = `${imports.join('\n')}\n\n${cssWithoutImports}`;
-                        fs.writeFileSync(cssPath, newCss, 'utf8');
-                        cssContent = newCss;
-                        fixes.push(`Reorganizado @import para o topo em ${cssFile}`);
-                    }
+                
+                if (lastImportEnd > 0) {
+                    cssContent = cssContent.slice(0, lastImportEnd) + '\n\n' + tailwindDirectives + cssContent.slice(lastImportEnd);
+                } else {
+                    cssContent = tailwindDirectives + cssContent;
                 }
-            } catch (e) {
-                issues.push(`Erro ao verificar ${cssFile}: ${e.message}`);
+                
+                fs.writeFileSync(cssFileInfo.abs, cssContent, 'utf8');
+                fixes.push(`Adicionado @tailwind base/components/utilities ao ${cssFileInfo.path}`);
             }
+
+            // Verifica @import depois de @tailwind
+            const firstImportIndex = cssContent.search(/@import\s+[^;]+;/);
+            const firstTailwindIndex = cssContent.search(/@tailwind\s+(base|components|utilities)\s*;/);
+
+            if (firstImportIndex !== -1 && firstTailwindIndex !== -1 && firstTailwindIndex < firstImportIndex) {
+                issues.push(`${cssFileInfo.path} tem @import depois de @tailwind (deve vir antes de todas as declarações)`);
+
+                const importRegex2 = /@import\s+[^;]+;/g;
+                const imports = [];
+                let m2;
+                while ((m2 = importRegex2.exec(cssContent)) !== null) {
+                    imports.push(m2[0]);
+                }
+
+                if (imports.length > 0) {
+                    const cssWithoutImports = cssContent.replace(importRegex2, '').trimStart();
+                    const newCss = `${imports.join('\n')}\n\n${cssWithoutImports}`;
+                    fs.writeFileSync(cssFileInfo.abs, newCss, 'utf8');
+                    cssContent = newCss;
+                    fixes.push(`Reorganizado @import para o topo em ${cssFileInfo.path}`);
+                }
+            }
+        } catch (e) {
+            issues.push(`Erro ao verificar ${cssFileInfo.path}: ${e.message}`);
+        }
+    }
+
+    // 7. Verificar se postcss.config e tailwind.config existem quando Tailwind é usado
+    const usesTailwind = allCssFiles.some(f => {
+        try {
+            const c = fs.readFileSync(f.abs, 'utf8');
+            return /@tailwind|@layer|@apply/i.test(c);
+        } catch { return false; }
+    });
+    
+    if (usesTailwind) {
+        const postcssConfigs = ['postcss.config.js', 'postcss.config.cjs', 'postcss.config.mjs'];
+        const hasPostcss = postcssConfigs.some(c => fs.existsSync(path.join(projectDir, c)));
+        if (!hasPostcss) {
+            issues.push('Projeto usa Tailwind mas não tem postcss.config');
+            const postcssContent = `module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`;
+            fs.writeFileSync(path.join(projectDir, 'postcss.config.js'), postcssContent, 'utf8');
+            fixes.push('Criado postcss.config.js');
+        }
+        
+        const tailwindConfigs = ['tailwind.config.ts', 'tailwind.config.js', 'tailwind.config.cjs'];
+        const hasTailwindConfig = tailwindConfigs.some(c => fs.existsSync(path.join(projectDir, c)));
+        if (!hasTailwindConfig) {
+            issues.push('Projeto usa Tailwind mas não tem tailwind.config');
         }
     }
 
@@ -292,6 +557,38 @@ app.post('/validate-project', (req, res) => {
 });
 
 // ============================================================
+// SSE: Monitoramento contínuo de erros do Vite
+// ============================================================
+app.get('/watch-errors', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders();
+    
+    // Registra o cliente SSE
+    sseClients.push(res);
+    
+    // Envia heartbeat a cada 15 segundos
+    const heartbeat = setInterval(() => {
+        res.write(': heartbeat\n\n');
+    }, 15000);
+    
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        sseClients = sseClients.filter(c => c !== res);
+    });
+});
+
+// Broadcast SSE para todos os clientes conectados
+function broadcastSSE(data) {
+    const msg = `data: ${JSON.stringify(data)}\n\n`;
+    sseClients.forEach(client => {
+        try { client.write(msg); } catch { /* skip dead clients */ }
+    });
+}
+
+// ============================================================
 // Smart-dev: instala se necessário, valida, e inicia dev server
 // ============================================================
 app.post('/smart-dev', async (req, res) => {
@@ -305,6 +602,10 @@ app.post('/smart-dev', async (req, res) => {
         try { currentProcess.kill(); } catch (e) {}
         currentProcess = null;
     }
+
+    // Limpa estado de erros ao iniciar novo dev
+    viteErrorBuffer = [];
+    processedErrors = new Set();
 
     const pm = (() => {
         if (packageManager) return packageManager;
@@ -323,7 +624,12 @@ app.post('/smart-dev', async (req, res) => {
 
     function pipe(child) {
         child.stdout.on('data', (d) => res.write(d.toString()));
-        child.stderr.on('data', (d) => res.write(d.toString()));
+        child.stderr.on('data', (d) => {
+            const text = d.toString();
+            res.write(text);
+            // Captura erros do stderr para monitoramento
+            handleViteStderr(text, cwd);
+        });
     }
 
     // === VALIDAÇÃO PRE-BUILD ===
@@ -333,6 +639,7 @@ app.post('/smart-dev', async (req, res) => {
         if (validation.fixes.length > 0) {
             for (const fix of validation.fixes) {
                 res.write(`INFO: [AUTO-FIX] ${fix}\n`);
+                broadcastSSE({ type: 'auto-fix', message: fix, autoFixed: true, file: extractFileFromFix(fix) });
             }
         }
         if (validation.issues.length > 0) {
@@ -394,6 +701,93 @@ app.post('/smart-dev', async (req, res) => {
     });
 });
 
+// ============================================================
+// Monitoramento de stderr do Vite com auto-fix
+// ============================================================
+let errorDebounceTimer = null;
+
+function handleViteStderr(text, projectDir) {
+    const ansi = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+    const cleaned = text.replace(ansi, '').trim();
+    if (!cleaned) return;
+    
+    // Padrões de erro relevantes do Vite/PostCSS/TypeScript
+    const errorPatterns = [
+        /Pre-transform error/i,
+        /Internal server error/i,
+        /@layer.*no matching.*@tailwind/i,
+        /`@layer base` is used but no matching/i,
+        /Failed to resolve import/i,
+        /Module not found/i,
+        /Cannot find module/i,
+        /error TS\d+/i,
+        /SyntaxError/i,
+        /RollupError/i,
+        /postcss/i,
+        /EADDRINUSE/i,
+        /Unexpected token/i,
+        /does not provide an export named/i,
+    ];
+    
+    const isError = errorPatterns.some(p => p.test(cleaned));
+    if (!isError) return;
+    
+    // Cria hash simples do erro para evitar processar duplicados
+    const errorKey = cleaned.substring(0, 200);
+    if (processedErrors.has(errorKey)) return;
+    processedErrors.add(errorKey);
+    
+    // Debounce: espera 1s antes de tentar auto-fix
+    clearTimeout(errorDebounceTimer);
+    errorDebounceTimer = setTimeout(() => {
+        const fixResults = autoFixViteError(cleaned, projectDir);
+        
+        if (fixResults.length > 0) {
+            // Auto-fix aplicado com sucesso
+            fixResults.forEach(fix => {
+                console.log(`[AUTO-FIX] ${fix}`);
+                broadcastSSE({ 
+                    type: 'auto-fix', 
+                    message: fix, 
+                    autoFixed: true,
+                    file: extractFileFromFix(fix),
+                    originalError: cleaned.substring(0, 300)
+                });
+            });
+        } else {
+            // Não conseguiu auto-fix, reporta o erro
+            broadcastSSE({ 
+                type: 'error', 
+                message: cleaned.substring(0, 500), 
+                autoFixed: false,
+                file: extractFileFromError(cleaned)
+            });
+        }
+    }, 1000);
+}
+
+// Extrai nome do arquivo de uma mensagem de fix
+function extractFileFromFix(fix) {
+    const m = fix.match(/(?:em|ao|in)\s+(\S+\.\w+)/i);
+    return m ? m[1] : null;
+}
+
+// Extrai nome do arquivo de uma mensagem de erro
+function extractFileFromError(error) {
+    const m = error.match(/([^\s:]+\.(css|tsx?|jsx?|ts|js)):\d+/i)
+        || error.match(/File:\s*([^\s:]+)/i);
+    if (m) {
+        const fullPath = m[1].replace(/\\/g, '/');
+        const srcIdx = fullPath.indexOf('/src/');
+        return srcIdx >= 0 ? fullPath.substring(srcIdx + 1) : fullPath;
+    }
+    return null;
+}
+
+// ============================================================
+// Rotas de gerenciamento de projeto
+// ============================================================
+
 // Rota para preparar o diretório de um projeto
 app.post('/prepare-project', (req, res) => {
     const { projectName } = req.body;
@@ -431,7 +825,6 @@ app.post('/save-file', (req, res) => {
     const fullPath = path.join(projectDir, filePath);
     
     try {
-        // Garante que o diretório do arquivo exista
         const dir = path.dirname(fullPath);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
@@ -459,9 +852,7 @@ app.post('/read-project', (req, res) => {
         return res.status(404).json({ error: 'Projeto não encontrado em Projetos/' + projectName });
     }
 
-    // Extensões de texto (lê conteúdo)
     const textAllowed = /\.(tsx|ts|js|jsx|css|json|html|md|txt|yaml|yml|toml|env|gitignore|prettierrc|eslintrc|editorconfig)$/i;
-    // Extensões de assets/binários (registra apenas path)
     const binaryAllowed = /\.(png|jpg|jpeg|gif|svg|webp|ico|bmp|tiff|mp3|mp4|wav|ogg|webm|woff|woff2|ttf|eot|otf|pdf)$/i;
     
     const denyDirs = new Set(['node_modules', '.git', 'dist', '.vite', 'build', '.next', '.cache', '.turbo']);
@@ -491,7 +882,6 @@ app.post('/read-project', (req, res) => {
                         files.push({ path: normalizedRel, code, binary: false });
                     } catch (err) {
                         console.warn('Falha ao ler', abs, err.message);
-                        // Tenta com encoding latin1 como fallback
                         try {
                             const code = fs.readFileSync(abs, 'latin1');
                             files.push({ path: normalizedRel, code, binary: false });
@@ -500,7 +890,6 @@ app.post('/read-project', (req, res) => {
                         }
                     }
                 } else if (binaryAllowed.test(entry.name)) {
-                    // Para binários, apenas registra o path (sem conteúdo)
                     try {
                         const stat = fs.statSync(abs);
                         files.push({ 
@@ -508,7 +897,7 @@ app.post('/read-project', (req, res) => {
                             code: '', 
                             binary: true,
                             size: stat.size,
-                            assetUrl: `/project-assets/${path.basename(path.dirname(projectDir))}/${normalizedRel}`
+                            assetUrl: `/project-assets/${projectName}/${normalizedRel}`
                         });
                     } catch (err) {
                         files.push({ path: normalizedRel, code: '', binary: true });
@@ -567,7 +956,6 @@ app.post('/move-file', (req, res) => {
         if (!fs.existsSync(srcFull)) {
             return res.status(404).json({ error: 'Arquivo de origem nao encontrado' });
         }
-        // Garante que o diretorio destino exista
         const dstDir = path.dirname(dstFull);
         if (!fs.existsSync(dstDir)) {
             fs.mkdirSync(dstDir, { recursive: true });
@@ -609,7 +997,6 @@ app.post('/execute', (req, res) => {
         return res.status(400).json({ error: 'Comando e diretório (cwd) são obrigatórios' });
     }
 
-    // Se já houver um processo rodando (como um dev server), mata ele antes de rodar outro
     if (currentProcess) {
         try {
             currentProcess.kill();
@@ -618,7 +1005,6 @@ app.post('/execute', (req, res) => {
 
     console.log(`Executando: ${command} em ${cwd}`);
 
-    // Configura a execução via PowerShell no Windows
     const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
     const args = process.platform === 'win32' ? ['-Command', command] : ['-c', command];
 
@@ -637,7 +1023,10 @@ app.post('/execute', (req, res) => {
     });
 
     child.stderr.on('data', (data) => {
-        res.write(`STDERR: ${data.toString()}`);
+        const text = data.toString();
+        res.write(`STDERR: ${text}`);
+        // Captura erros do stderr para monitoramento
+        handleViteStderr(text, cwd);
     });
 
     child.on('close', (code) => {
@@ -657,7 +1046,6 @@ app.post('/execute', (req, res) => {
 app.post('/kill-process', (req, res) => {
     if (currentProcess) {
         try {
-            // No Windows, precisamos matar a arvore de processos
             if (process.platform === 'win32') {
                 const { execSync } = require('child_process');
                 try {
@@ -746,4 +1134,5 @@ app.listen(PORT, () => {
     console.log(`Servidor de comandos BuilderAI rodando em http://localhost:${PORT}`);
     console.log(`Pronto para executar comandos via PowerShell.`);
     console.log(`Assets estáticos servidos em: http://localhost:${PORT}/project-assets/`);
+    console.log(`Monitoramento SSE de erros em: http://localhost:${PORT}/watch-errors`);
 });

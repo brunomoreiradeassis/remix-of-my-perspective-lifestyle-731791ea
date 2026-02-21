@@ -77,6 +77,8 @@ interface OllamaContextType {
   nukeNodeModules: () => Promise<void>;
   installDependency: (pkg: string) => Promise<void>;
   isFixingErrors: boolean;
+  autoFixLog: Array<{ message: string; file: string | null; timestamp: string }>;
+  clearAutoFixLog: () => void;
   projectComponents: string[];
   projectTemplate: string;
   lastPrompt: string | null;
@@ -197,6 +199,7 @@ export function OllamaProvider({ children }: { children: ReactNode }) {
 
   const [buildErrors, setBuildErrors] = useState<string[]>([]);
   const [isFixingErrors, setIsFixingErrors] = useState(false);
+  const [autoFixLog, setAutoFixLog] = useState<Array<{ message: string; file: string | null; timestamp: string }>>([]);
 
   const addBuildError = useCallback((error: string) => {
     setBuildErrors(prev => {
@@ -207,6 +210,10 @@ export function OllamaProvider({ children }: { children: ReactNode }) {
 
   const clearBuildErrors = useCallback(() => {
     setBuildErrors([]);
+  }, []);
+
+  const clearAutoFixLog = useCallback(() => {
+    setAutoFixLog([]);
   }, []);
 
   // Combina todos os erros em uma lista unificada
@@ -470,6 +477,45 @@ export function OllamaProvider({ children }: { children: ReactNode }) {
     const interval = setInterval(ping, 15000);
     return () => clearInterval(interval);
   }, []);
+
+  // SSE: Monitoramento contínuo de erros do Vite via /watch-errors
+  useEffect(() => {
+    if (!serverOnline) return;
+    
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource("http://localhost:3001/watch-errors");
+      
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'auto-fix') {
+            setAutoFixLog(prev => [...prev, { 
+              message: data.message, 
+              file: data.file || null, 
+              timestamp: new Date().toISOString() 
+            }]);
+            toast({
+              title: "Auto-Fix aplicado",
+              description: data.message,
+              duration: 4000,
+            });
+          } else if (data.type === 'error') {
+            addBuildError(data.message);
+          }
+        } catch { /* skip malformed data */ }
+      };
+      
+      es.onerror = () => {
+        // EventSource auto-reconnects
+      };
+    } catch { /* SSE not available */ }
+    
+    return () => {
+      if (es) es.close();
+    };
+  }, [serverOnline, addBuildError]);
 
   // Limpar qualquer referencia salva a porta 8080 (porta do sistema)
   useEffect(() => {
@@ -1614,6 +1660,7 @@ export function OllamaProvider({ children }: { children: ReactNode }) {
       consoleErrors, addConsoleError, clearConsoleErrors,
       buildErrors, addBuildError, clearBuildErrors, allErrors,
       runBuildCheck, nukeNodeModules, installDependency, isFixingErrors,
+      autoFixLog, clearAutoFixLog,
       pendingErrorFix, setPendingErrorFix,
       projectComponents, projectTemplate, lastPrompt, setLastPrompt, lastError, setLastError, currentFile, setCurrentFile: (p) => { setCurrentFileState(p); localStorage.setItem("current-file", p ?? ""); },
       chatSessions, currentChatId, setCurrentChatId, saveChatSession, loadChatSession, loadChatSessions, projectName: derivedProjectName,

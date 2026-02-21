@@ -16,6 +16,8 @@ export function PreviewPanel() {
     setPendingErrorFix,
     addConsoleError,
     setManualPort,
+    buildErrors,
+    allErrors,
   } = useOllama();
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -49,6 +51,16 @@ export function PreviewPanel() {
   const [reloadTick, setReloadTick] = useState(0);
   const [frameError, setFrameError] = useState<string | null>(null);
   const [errorsModalOpen, setErrorsModalOpen] = useState(false);
+  const prevErrorCountRef = useRef(0);
+
+  // Auto-abrir ErrorDiagnosticModal quando novos erros de build surgem
+  useEffect(() => {
+    const totalErrors = allErrors.length;
+    if (totalErrors > prevErrorCountRef.current && totalErrors > 0) {
+      setErrorsModalOpen(true);
+    }
+    prevErrorCountRef.current = totalErrors;
+  }, [allErrors.length]);
 
   // Persist mode and manual port
   useEffect(() => {
