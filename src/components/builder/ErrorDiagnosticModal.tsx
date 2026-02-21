@@ -10,6 +10,8 @@ import {
   Terminal,
   ChevronDown,
   ChevronRight,
+  CheckCircle,
+  FileCode,
 } from "lucide-react";
 import { useOllama } from "@/contexts/OllamaContext";
 import { Button } from "@/components/ui/button";
@@ -32,9 +34,11 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
     installDependency,
     setPendingErrorFix,
     isFixingErrors,
+    autoFixLog,
+    clearAutoFixLog,
   } = useOllama();
 
-  const [activeTab, setActiveTab] = useState<"all" | "build" | "console">("all");
+  const [activeTab, setActiveTab] = useState<"all" | "build" | "console" | "autofix">("all");
   const [pkgInput, setPkgInput] = useState("");
   const [isChecking, setIsChecking] = useState(false);
   const [isNuking, setIsNuking] = useState(false);
@@ -47,7 +51,9 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
     ? allErrors
     : activeTab === "build"
     ? allErrors.filter((e) => e.type === "build")
-    : allErrors.filter((e) => e.type === "console");
+    : activeTab === "console"
+    ? allErrors.filter((e) => e.type === "console")
+    : [];
 
   const handleFixAll = () => {
     const errorText = filteredErrors
@@ -95,6 +101,18 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
     .filter((pkg): pkg is string => !!pkg && !pkg.startsWith(".") && !pkg.startsWith("/"))
     .filter((pkg, i, arr) => arr.indexOf(pkg) === i);
 
+  // Extract file from error message
+  const extractFileFromError = (msg: string): string | null => {
+    const m = msg.match(/([^\s:]+\.(css|tsx?|jsx?|ts|js)):\d+/i)
+      || msg.match(/File:\s*([^\s:]+)/i);
+    if (m) {
+      const fullPath = m[1].replace(/\\/g, '/');
+      const srcIdx = fullPath.indexOf('/src/');
+      return srcIdx >= 0 ? fullPath.substring(srcIdx + 1) : fullPath;
+    }
+    return null;
+  };
+
   return (
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm"
@@ -120,7 +138,7 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
                 Diagnostico de Erros
               </h2>
               <span className="text-[11px] text-[#6c7086]">
-                {allErrors.length} erro(s) detectado(s)
+                {allErrors.length} erro(s) • {autoFixLog.length} correção(ões) automática(s)
               </span>
             </div>
           </div>
@@ -142,14 +160,16 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
 
         {/* Tabs */}
         <div className="flex items-center gap-1 px-5 pt-3 pb-2">
-          {(["all", "build", "console"] as const).map((tab) => {
+          {(["all", "build", "console", "autofix"] as const).map((tab) => {
             const count =
               tab === "all"
                 ? allErrors.length
                 : tab === "build"
                 ? buildErrors.length
-                : consoleErrors.length;
-            const label = tab === "all" ? "Todos" : tab === "build" ? "Build" : "Console";
+                : tab === "console"
+                ? consoleErrors.length
+                : autoFixLog.length;
+            const label = tab === "all" ? "Todos" : tab === "build" ? "Build" : tab === "console" ? "Console" : "Auto-Fix";
             return (
               <button
                 key={tab}
@@ -162,6 +182,7 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
               >
                 {tab === "build" && <Terminal className="h-3 w-3" />}
                 {tab === "console" && <AlertTriangle className="h-3 w-3" />}
+                {tab === "autofix" && <CheckCircle className="h-3 w-3" />}
                 {label}
                 {count > 0 && (
                   <Badge
@@ -170,6 +191,8 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
                         ? "bg-[#fab38720] text-[#fab387] border-0"
                         : tab === "console"
                         ? "bg-[#f38ba820] text-[#f38ba8] border-0"
+                        : tab === "autofix"
+                        ? "bg-[#a6e3a120] text-[#a6e3a1] border-0"
                         : "bg-[#6c708620] text-[#cdd6f4] border-0"
                     }`}
                   >
@@ -181,9 +204,45 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
           })}
         </div>
 
-        {/* Error List */}
+        {/* Error List / Auto-Fix Log */}
         <div className="flex-1 overflow-auto px-5 py-2 space-y-1.5 min-h-0">
-          {filteredErrors.length === 0 ? (
+          {activeTab === "autofix" ? (
+            // Auto-Fix Log Tab
+            autoFixLog.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12 gap-3">
+                <div className="h-10 w-10 rounded-full flex items-center justify-center" style={{ backgroundColor: "#a6e3a120" }}>
+                  <CheckCircle className="h-5 w-5 text-[#a6e3a1]" />
+                </div>
+                <span className="text-sm text-[#6c7086]">Nenhuma correção automática aplicada</span>
+              </div>
+            ) : (
+              autoFixLog.map((fix, i) => (
+                <div
+                  key={i}
+                  className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg border text-xs"
+                  style={{ borderColor: "#a6e3a130", backgroundColor: "#a6e3a108" }}
+                >
+                  <CheckCircle className="h-3.5 w-3.5 text-[#a6e3a1] shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <span className="text-[#cdd6f4] font-mono break-all leading-relaxed">
+                      {fix.message}
+                    </span>
+                    {fix.file && (
+                      <div className="mt-1">
+                        <Badge className="h-5 px-2 text-[9px] font-mono bg-[#89b4fa15] text-[#89b4fa] border-0 gap-1">
+                          <FileCode className="h-2.5 w-2.5" />
+                          Modificando {fix.file}
+                        </Badge>
+                      </div>
+                    )}
+                  </div>
+                  <span className="text-[9px] text-[#45475a] shrink-0 font-mono">
+                    {new Date(fix.timestamp).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                  </span>
+                </div>
+              ))
+            )
+          ) : filteredErrors.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 gap-3">
               <div className="h-10 w-10 rounded-full flex items-center justify-center" style={{ backgroundColor: "#a6e3a120" }}>
                 <RefreshCw className="h-5 w-5 text-[#a6e3a1]" />
@@ -201,38 +260,49 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
               </Button>
             </div>
           ) : (
-            filteredErrors.map((err, i) => (
-              <div
-                key={i}
-                className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg border text-xs group"
-                style={{
-                  borderColor: err.type === "build" ? "#fab38730" : "#f38ba830",
-                  backgroundColor: err.type === "build" ? "#fab38708" : "#f38ba808",
-                }}
-              >
-                <Badge
-                  className={`shrink-0 mt-0.5 h-4 px-1.5 text-[9px] uppercase font-bold tracking-wider border-0 ${
-                    err.type === "build"
-                      ? "bg-[#fab38720] text-[#fab387]"
-                      : "bg-[#f38ba820] text-[#f38ba8]"
-                  }`}
+            filteredErrors.map((err, i) => {
+              const file = extractFileFromError(err.message);
+              return (
+                <div
+                  key={i}
+                  className="flex flex-col gap-1.5 px-3 py-2.5 rounded-lg border text-xs group"
+                  style={{
+                    borderColor: err.type === "build" ? "#fab38730" : "#f38ba830",
+                    backgroundColor: err.type === "build" ? "#fab38708" : "#f38ba808",
+                  }}
                 >
-                  {err.type}
-                </Badge>
-                <span className="flex-1 text-[#cdd6f4] font-mono break-all leading-relaxed">
-                  {err.message}
-                </span>
-                <button
-                  onClick={() => handleFixSingle(err)}
-                  disabled={isFixingErrors}
-                  className="shrink-0 flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-all opacity-0 group-hover:opacity-100 focus:opacity-100 bg-[#89b4fa20] text-[#89b4fa] hover:bg-[#89b4fa40] disabled:opacity-50"
-                  title="Fixar este erro com IA"
-                >
-                  <Wrench className="h-3 w-3" />
-                  Fixar
-                </button>
-              </div>
-            ))
+                  <div className="flex items-start gap-2.5">
+                    <Badge
+                      className={`shrink-0 mt-0.5 h-4 px-1.5 text-[9px] uppercase font-bold tracking-wider border-0 ${
+                        err.type === "build"
+                          ? "bg-[#fab38720] text-[#fab387]"
+                          : "bg-[#f38ba820] text-[#f38ba8]"
+                      }`}
+                    >
+                      {err.type}
+                    </Badge>
+                    <span className="flex-1 text-[#cdd6f4] font-mono break-all leading-relaxed">
+                      {err.message}
+                    </span>
+                    <button
+                      onClick={() => handleFixSingle(err)}
+                      disabled={isFixingErrors}
+                      className="shrink-0 flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-all opacity-0 group-hover:opacity-100 focus:opacity-100 bg-[#89b4fa20] text-[#89b4fa] hover:bg-[#89b4fa40] disabled:opacity-50"
+                      title="Fixar este erro com IA"
+                    >
+                      <Wrench className="h-3 w-3" />
+                      Fixar
+                    </button>
+                  </div>
+                  {file && (
+                    <Badge className="self-start h-5 px-2 text-[9px] font-mono bg-[#f38ba810] text-[#f9e2af] border-0 gap-1">
+                      <FileCode className="h-2.5 w-2.5" />
+                      {file}
+                    </Badge>
+                  )}
+                </div>
+              );
+            })
           )}
         </div>
 
@@ -337,6 +407,7 @@ export function ErrorDiagnosticModal({ open, onClose }: ErrorDiagnosticModalProp
                 onClick={() => {
                   clearBuildErrors();
                   clearConsoleErrors();
+                  clearAutoFixLog();
                 }}
               >
                 Limpar tudo
